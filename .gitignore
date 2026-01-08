@@ -1,0 +1,22 @@
+.DS_Store
+.idea/cas-project.iml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+.python-version
+info/assignment_idea_and_instructions
+info/everything.pdf
+info/Final Project.pdf
+info/solutions/.DS_Store
+info/solutions/CAS assignment 1 Solution.ipynb
+info/solutions/CAS Assignment 2 Solution.ipynb
+info/solutions/CAS Assignment 3 Solution.ipynb
+info/solutions/CAS Assignment 4 Solution.ipynb
+info/solutions/CAS Assignment 5 Solution.ipynb
+info/solutions/CAS Assignment 6 Solution.ipynb
+info/solutions/CAS Assignment 7 Solution.ipynb
+src/.DS_Store
+src/__pycache__/gymnax_rocket_env.cpython-311.pyc
+src/rocket_env.py
