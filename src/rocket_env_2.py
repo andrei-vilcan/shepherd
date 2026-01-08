@@ -275,43 +275,41 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
     def _compute_reward(self, old_state: EnvState, new_state: EnvState, params: EnvParams) -> jax.Array:
         """Compute reward."""
 
-        reward = 0
+        reward = jnp.array(0.0)
 
-        ### preliminary calculation
+        ### preliminary calculations
 
-        # radius
+        ## new state
         r = jnp.sqrt(new_state.x**2 + new_state.y**2)
         altitude = r - params.planet_radius
-
         landed = r <= params.planet_radius
-        # r -> 0 => higher reward
 
         v_landing = jnp.sqrt(new_state.dx**2 + new_state.y**2)
         v_radial = (new_state.x * new_state.dx + new_state.y * new_state.dy) / r
-        # v_radial -> 0 => higher reward
 
         # get angular distance from target landing spot
         positional_angle = jnp.arctan2(state.y, state.x)
-        delta_angle = state.target_angle - positional_angle
-        delta_angle = jnp.abs(angle_normalize(delta_angle))
-
-        # delta_angle -> 0 => higher reward
-
+        delta_angle = jnp.abs(angle_normalize(state.target_angle - positional_angle))
 
         # get rocket orientation relative to surface
-        theta_relative = state.theta - positional_angle
-        theta_relative = angle_normalize(theta_relative)
+        theta_relative = angle_normalize(state.theta - positional_angle)
 
-        # theta_relative -> 0 => higher reward
+        ## old state
+        r_old = jnp.sqrt(old_state.x ** 2 + old_state.y ** 2)
+        altitude_old = r_old - params.planet_radius
 
+        v_radial_old = (old_state.x * old_state.dx + old_state.y * old_state.dy) / r_old
 
-        # landing traits
+        old_positional_angle = jnp.arctan2(old_state.y, old_state.x)
+        old_delta_angle = jnp.abs(state.target_angle - old_positional_angle)
+
+        old_theta_relative = angle_normalize(old_state.theta - old_positional_angle)
+
+        ## landing traits
         slow = v_landing < params.landing_max_speed
         correct_position = delta_angle <= params.landing_position_tolerance
-        correct_orientation = -params.landing_max_angle <= theta_relative <= params.landing_max_angle
-        low_spin = -params.landing_max_omega <= state.omega <= params.landing_max_omega
-
-
+        correct_orientation = jnp.abs(theta_relative) <= params.landing_max_angle
+        low_spin = jnp.abs(new_state.omega) <= params.landing_max_omega
 
         ### reward calculation
 
@@ -330,70 +328,45 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         reward = jnp.where(ni_il, params.reward_ni_il, 0.0)
 
         ## rewards for non-terminal states
-        
+        non_terminal = ~landed
+
         # altitude -> 0
-        r_old = jnp.sqrt(old_state.x**2 + old_state.y**2)
-        altitude_old = r_old - params.planet_radius
         delta_altitude = altitude - altitude_old
-        reward += -delta_altitude * params.reward_altitude_factor
+        reward += non_terminal * delta_altitude * params.reward_altitude_factor
 
         # if altitude -> 0
         # delta_angle -> 0
-        old_delta_angle = jnp.abs(state.target_angle - jnp.arctan2(old_state.y, old_state.x))
+        altitude_factor = jnp.exp(-altitude)
         delta_delta_angle = old_delta_angle - delta_angle
-        reward += delta_delta_angle * params.reward_angular_position_factor * 1/(r - params.planet_radius + 1e-3)**2
+        reward += non_terminal * delta_delta_angle * params.reward_angular_position_factor * altitude_factor
 
-        # if altitude ~= 0 and delta_angle ~= 0
+        # if altitude -> 0 and delta_angle -> 0
         # rocket radial velocity -> 0
-        v_radial_old = (old_state.x * old_state.dx + old_state.y * old_state.dy) / r_old
+        altitude_and_delta_angle_factor = jnp.exp(-altitude) * jnp.exp(-delta_angle)
         delta_radial_velocity = v_radial - v_radial_old
-        reward += delta_radial_velocity * params.reward_radial_velocity_factor # 1/
+        reward += non_terminal * delta_radial_velocity * params.reward_radial_velocity_factor * altitude_and_delta_angle_factor
 
         # if altitude -> 0 and delta_angle -> 0 and rocket radial velocity -> 0
-        # rocket angle -> pi/2
+        # theta_error -> 0
+        altitude_delta_angle_velocity_factor = jnp.exp(-altitude) * jnp.exp(-delta_angle) * jnp.exp(-jnp.abs(v_radial))
+        delta_theta_relative = jnp.abs(old_theta_relative) - jnp.abs(theta_relative)
+        reward += non_terminal * delta_theta_relative * params.reward_angle_factor * altitude_delta_angle_velocity_factor
 
-
-        # if altitude -> 0 and delta_angle -> 0 and rocket radial velocity -> 0
+        # if altitude -> 0 and delta_angle -> 0 and rocket radial velocity -> 0 and theta_error -> 0
         # angular_velocity -> 0
+        altitude_delta_angle_velocity_angle_factor = jnp.exp(-altitude) * jnp.exp(-delta_angle) * jnp.exp(-jnp.abs(v_radial)) * jnp.exp(-jnp.abs(theta_relative))
+        delta_omega = jnp.abs(old_state.omega) - jnp.abs(new_state.omega)
+        reward += non_terminal * delta_omega * params.reward_angular_velocity_factor * altitude_delta_angle_velocity_angle_factor
 
-
-
-
-
-
-
-
-
+        # very small fuel usage penalty
         fuel_used = old_state.fuel - new_state.fuel
-        reward = reward - params.reward_fuel_penalty * fuel_used
+        reward -= params.reward_fuel_penalty * fuel_used
 
-        # Penalty for running out of fuel while still in air
-        # if no fuel while far away from planet
+        # penalty if no fuel while far away from planet
         out_of_fuel_penalty = (new_state.fuel == 0) and r - params.planet_radius
         reward = jnp.where(out_of_fuel_penalty, reward + params.reward_out_of_fuel * 0.01, reward)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        # return jnp.array(reward)
-        # return reward
-        return
+        return reward
 
     @property
     def name(self) -> str:
