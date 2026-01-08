@@ -43,42 +43,49 @@ class EnvParams(environment.EnvParams):
     dt: float = 0.05
 
     planet_radius: float = 50.
-    planet_mass: float = 6.0e16
+    planet_mass: float = 5.0e14
 
-    rocket_max_thrust: float = 14000.0
+    rocket_max_thrust: float = 38000.0
     rocket_max_gimbal: float = 0.3
     rocket_mass: float = 2600.0
     rocket_moment_of_inertia: float = 250.0
-    rocket_initial_fuel: float = 2000.0
-    rocket_fuel_consumption_rate: float = 50.0
+    rocket_initial_fuel: float = 5000.0
+    rocket_fuel_consumption_rate: float = 100.
 
-    init_min_orbit_radius: float = 70.0
-    init_max_orbit_radius: float = 300.0
+    init_min_orbit_radius: float = 80.0
+    init_max_orbit_radius: float = 150.0
     init_orbit_velocity_noise: float = 0.1
 
     noise_pos: float = 0.1
     noise_vel: float = 0.5
     noise_angle: float = 0.1
 
-    max_steps_in_episode: int = 1000
+    max_steps_in_episode: int = 1500
 
     landing_max_speed: float = 2.0
     landing_max_angle: float = 0.3
     landing_max_omega: float = 0.5
     landing_position_tolerance: float = jnp.pi/30
 
-    reward_i_cl: float = 100.0
-    reward_ni_cl : float = -50.0
-    reward_ni_il: float = -50.0
-    reward_out_of_fuel: float = -40.0
-    reward_out_of_bounds: float = -30.0
-    reward_altitude_factor: float = 0.5
-    reward_angular_position_factor: float = 0.5
-    reward_radial_velocity_factor: float = 0.5
-    reward_tangential_velocity_factor: float = 0.5
-    reward_angle_factor: float = 0.5
-    reward_angular_velocity_factor: float = 0.05
-    reward_fuel_penalty: float = 0.01
+    # Terminal rewards (now dominate since step rewards are scaled down)
+    reward_i_cl: float = 1000.0
+    reward_ni_cl : float = -100.0
+    reward_ni_il: float = -300.0
+    reward_slow_landing_base: float = 500.0
+    reward_out_of_fuel: float = -50.0
+    reward_out_of_bounds: float = -500.0
+    reward_timeout: float = -500.0
+    # Per-step shaping rewards (scaled down by 1000x)
+    reward_altitude_factor: float = 0.001
+    reward_angular_position_factor: float = 0.0003
+    reward_radial_velocity_factor: float = 0.0003
+    reward_tangential_velocity_factor: float = 0.0005
+    reward_angle_factor: float = 0.0003
+    reward_angular_velocity_factor: float = 0.00005
+    reward_fuel_penalty: float = 0.000001
+    reward_low_velocity_near_surface: float = 0.0005
+    reward_deceleration_with_fuel: float = 0.0003
+    reward_retrograde_orientation: float = 0.0005
 
 
 class RocketLander(environment.Environment[EnvState, EnvParams]):
@@ -286,12 +293,12 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
 
         landed = r <= params.planet_radius
 
-        escaped = r > params.planet_radius * 6
+        escaped = r > params.planet_radius * 4
 
         done = landed | timeout | escaped
         return jnp.array(done)
 
-    def _compute_reward(self, old_state: EnvState, new_state: EnvState, params: EnvParams) -> jax.Array:
+    def _compute_reward_2(self, old_state: EnvState, new_state: EnvState, params: EnvParams) -> jax.Array:
         """Compute reward."""
 
         reward = jnp.array(0.0)
@@ -304,7 +311,7 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         normalized_altitude = altitude / params.planet_radius
 
         landed = r <= params.planet_radius
-        escaped = r > params.planet_radius * 6
+        escaped = r > params.planet_radius * 4
 
         # get angular distance from target landing spot
         positional_angle = jnp.arctan2(new_state.y, new_state.x)
@@ -344,61 +351,95 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         i_cl = landed & slow & correct_position & correct_orientation & low_spin
         reward = jnp.where(i_cl, params.reward_i_cl, reward)
 
-        # non-ideal landing at correct location
-        ni_cl = landed & correct_position & ~(slow & correct_orientation & low_spin)
+        # slow landing but not at correct position - reward scaled by proximity to target
+        # closer to target = higher reward (max reward_slow_landing_base at target, decreasing with distance)
+        proximity_factor = 1.0 / (1.0 + delta_angle)  # 1.0 at target, decreasing with angular distance
+        slow_landing_reward = params.reward_slow_landing_base * proximity_factor
+        slow_not_on_target = landed & slow & ~correct_position
+        reward = jnp.where(slow_not_on_target, slow_landing_reward, reward)
+
+        # non-ideal (fast) landing at correct location
+        ni_cl = landed & correct_position & ~slow
         reward = jnp.where(ni_cl, params.reward_ni_cl, reward)
 
         # non-ideal landing at incorrect location
-        ni_il = landed & ~correct_position # & ~(slow & correct_orientation & low_spin)
+        ni_il = landed & ~correct_position & ~slow
         reward = jnp.where(ni_il, params.reward_ni_il, reward)
 
         # penalty for escaping
         reward = jnp.where(escaped, params.reward_out_of_bounds, reward)
 
-        ## rewards for non-terminal states
-        non_terminal = ~landed & ~escaped
+        # penalty for timeout
+        max_time = params.max_steps_in_episode * params.dt
+        timeout = new_state.time >= max_time
+        reward = jnp.where(timeout & ~landed, params.reward_timeout, reward)
 
-        # altitude -> 0
+        ## rewards for non-terminal states
+        non_terminal = ~landed & ~escaped & ~timeout
+
+        # reward tangential velocity -> 0
+        delta_tangential_velocity = jnp.abs(old_v_tangential) - jnp.abs(v_tangential)
+        reward += non_terminal * delta_tangential_velocity * params.reward_tangential_velocity_factor
+
+        # reward altitude -> 0
         delta_altitude = old_altitude - altitude
         reward += non_terminal * delta_altitude * params.reward_altitude_factor
 
-        # if altitude -> 0
-        # delta_angle -> 0
-        altitude_factor = jnp.exp(-normalized_altitude)
+        # if altitude ~ -> 0
+        # reward retrograde orientation -> 0
+        velocity_angle = jnp.arctan2(new_state.dy, new_state.dx)
+        retrograde_angle = velocity_angle + jnp.pi
+        orientation_error = jnp.abs(angle_normalize(new_state.theta - retrograde_angle))
+        retrograde_bonus = 1.0 / (1.0 + orientation_error)
+        high_altitude_factor = normalized_altitude / (1.0 + normalized_altitude)
+        reward += non_terminal * retrograde_bonus * high_altitude_factor * params.reward_retrograde_orientation
+
+        # if tangential velocity -> 0
+        # reward delta_angle -> 0
+        tangential_factor = 1.0 / (1.0 + jnp.abs(v_tangential))
         delta_delta_angle = old_delta_angle - delta_angle
-        reward += non_terminal * delta_delta_angle * params.reward_angular_position_factor * altitude_factor
+        reward += non_terminal * delta_delta_angle * params.reward_angular_position_factor * tangential_factor
 
-        # if altitude -> 0 and delta_angle -> 0
-        # rocket radial velocity -> 0
-        altitude_delta_angle_factor = jnp.exp(-normalized_altitude) * jnp.exp(-delta_angle)
+        # if tangential velocity -> 0 and delta_angle -> 0
+        # reward radial velocity -> 0
+        tangential_angle_factor = tangential_factor * 1.0 / (1.0 + delta_angle)
         delta_radial_velocity = jnp.abs(old_v_radial) - jnp.abs(v_radial)
-        reward += non_terminal * delta_radial_velocity * params.reward_radial_velocity_factor * altitude_delta_angle_factor
+        reward += non_terminal * delta_radial_velocity * params.reward_radial_velocity_factor * tangential_angle_factor
 
-        # if altitude -> 0 and delta_angle -> 0 and rocket radial velocity -> 0
-        # rocket tangential velocity -> 0
-        altitude_delta_angle_radial_factor = jnp.exp(-normalized_altitude) * jnp.exp(-delta_angle) * jnp.exp(-jnp.abs(v_radial))
-        delta_tangential_velocity = jnp.abs(old_v_tangential) - jnp.abs(v_tangential)
-        reward += non_terminal * delta_tangential_velocity * params.reward_tangential_velocity_factor * altitude_delta_angle_radial_factor
-
-        # if altitude -> 0 and delta_angle -> 0 and rocket radial velocity -> 0 and rocket tangential velocity -> 0
-        # theta_relative -> 0
-        altitude_delta_angle_radial_tangential_factor = jnp.exp(-normalized_altitude) * jnp.exp(-delta_angle) * jnp.exp(-jnp.abs(v_radial)) * jnp.exp(-jnp.abs(v_tangential))
+        # if tangential velocity -> 0 and delta_angle -> 0 and radial velocity -> 0
+        # reward theta_relative -> 0
+        tangential_angle_radial_factor = tangential_angle_factor * 1.0 / (1.0 + jnp.abs(v_radial))
         delta_theta_relative = jnp.abs(old_theta_relative) - jnp.abs(theta_relative)
-        reward += non_terminal * delta_theta_relative * params.reward_angle_factor * altitude_delta_angle_radial_tangential_factor
+        reward += non_terminal * delta_theta_relative * params.reward_angle_factor * tangential_angle_radial_factor
 
-        # if altitude -> 0 and delta_angle -> 0 and rocket radial velocity -> 0 and rocket tangential velocity -> 0 and theta_relative -> 0
-        # angular_velocity -> 0
-        altitude_delta_angle_radial_tangential_theta_factor = jnp.exp(-normalized_altitude) * jnp.exp(-delta_angle) * jnp.exp(-jnp.abs(v_radial)) * jnp.exp(-jnp.abs(v_tangential)) * jnp.exp(-jnp.abs(theta_relative))
+        # if tangential velocity -> 0 and delta_angle -> 0 and radial velocity -> 0 and theta_relative -> 0
+        # reward angular_velocity -> 0
+        tangential_angle_radial_theta_factor = tangential_angle_radial_factor * 1.0 / (1.0 + jnp.abs(theta_relative))
         delta_omega = jnp.abs(old_state.omega) - jnp.abs(new_state.omega)
-        reward += non_terminal * delta_omega * params.reward_angular_velocity_factor * altitude_delta_angle_radial_tangential_theta_factor
+        reward += non_terminal * delta_omega * params.reward_angular_velocity_factor * tangential_angle_radial_theta_factor
+
+        # if altitude -> 0
+        # reward low velocity
+        surface_proximity = 1.0 / (1.0 + normalized_altitude)
+        velocity_magnitude = jnp.sqrt(v_radial**2 + v_tangential**2)
+        low_velocity_bonus = surface_proximity * 1.0 / (1.0 + velocity_magnitude)
+        reward += non_terminal * low_velocity_bonus * params.reward_low_velocity_near_surface
+
+        # if fuel -> 0
+        # reward velocity -> 0, altitude -> 0
+        fuel_used = old_state.fuel - new_state.fuel
+        old_velocity_magnitude = jnp.sqrt(old_v_radial**2 + old_v_tangential**2)
+        velocity_decrease = old_velocity_magnitude - velocity_magnitude
+        altitude_decreasing = delta_altitude > 0
+        deceleration_reward = jnp.maximum(0.0, velocity_decrease) * fuel_used * altitude_decreasing
+        reward += non_terminal * deceleration_reward * params.reward_deceleration_with_fuel
 
         # very small fuel usage penalty
-        fuel_used = old_state.fuel - new_state.fuel
         reward -= params.reward_fuel_penalty * fuel_used
 
         # penalty if no fuel while far away from planet
         no_fuel = new_state.fuel <= 0
-        reward = jnp.where(no_fuel, reward + params.reward_out_of_fuel * normalized_altitude, reward)
+        reward = jnp.where(no_fuel & non_terminal, reward + params.reward_out_of_fuel * normalized_altitude, reward)
 
         return reward
 
@@ -423,149 +464,12 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
 
     def observation_space(self, params: Optional[EnvParams] = None) -> spaces.Box:
         """Observation space of the environment."""
-        low = jnp.array([-10.0, -jnp.pi, -100.0, -100.0, -jnp.pi, -10.0, 0.0, -0.5, 0.0])
-        high = jnp.array([500.0, jnp.pi, 100.0, 100.0, jnp.pi, 10.0, 1.0, 0.5, 2500.0])
+        # [altitude, delta_angle, radial_vel, tangential_vel, theta_relative, omega, throttle, gimbal, fuel]
+        low = jnp.array([-10.0, -jnp.pi, -50.0, -50.0, -jnp.pi, -10.0, 0.0, -0.5, 0.0])
+        high = jnp.array([150.0, jnp.pi, 50.0, 50.0, jnp.pi, 10.0, 1.0, 0.5, 5000.0])
         return spaces.Box(low, high, shape=(9,), dtype=jnp.float32)
 
 
 def angle_normalize(x: jax.Array) -> jax.Array:
     """Normalize the angle - radians."""
     return ((x + jnp.pi) % (2 * jnp.pi)) - jnp.pi
-
-
-def visualize_trajectory(states: list, params: EnvParams, title: str = "Rocket Landing Trajectory", save_path: Optional[str] = None):
-    """
-    Visualize the rocket trajectory around the planet.
-
-    Args:
-        states: List of EnvState objects from an episode
-        params: Environment parameters
-        title: Plot title
-        save_path: If provided, save figure to this path
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-
-    # Draw planet
-    theta = np.linspace(0, 2 * np.pi, 100)
-    planet_x = params.planet_radius * np.cos(theta)
-    planet_y = params.planet_radius * np.sin(theta)
-    ax.fill(planet_x, planet_y, color='#3d5a80', alpha=0.8, label='Planet')
-    ax.plot(planet_x, planet_y, color='#1d3557', linewidth=2)
-
-    # Extract trajectory
-    xs = np.array([float(s.x) for s in states])
-    ys = np.array([float(s.y) for s in states])
-    throttles = np.array([float(s.throttle) for s in states])
-
-    # Draw trajectory colored by throttle
-    points = np.array([xs, ys]).T.reshape(-1, 1, 2)
-    segments = np.concatenate([points[:-1], points[1:]], axis=1)
-
-    from matplotlib.collections import LineCollection
-    norm = plt.Normalize(0, 1)
-    lc = LineCollection(segments, cmap='YlOrRd', norm=norm, linewidth=2, alpha=0.8)
-    lc.set_array(throttles[:-1])
-    ax.add_collection(lc)
-    plt.colorbar(lc, ax=ax, label='Throttle')
-
-    # Mark start and end
-    ax.scatter(xs[0], ys[0], s=100, c='green', marker='o', zorder=5, label='Start')
-    ax.scatter(xs[-1], ys[-1], s=100, c='red', marker='x', zorder=5, label='End')
-
-    # Draw target landing site
-    target_angle = float(states[0].target_angle)
-    target_x = params.planet_radius * np.cos(target_angle)
-    target_y = params.planet_radius * np.sin(target_angle)
-    ax.scatter(target_x, target_y, s=200, c='yellow', marker='*', zorder=5,
-               edgecolors='black', label='Target')
-
-    # Draw rocket orientation at a few points
-    n_arrows = min(10, len(states))
-    arrow_indices = np.linspace(0, len(states) - 1, n_arrows, dtype=int)
-    for idx in arrow_indices:
-        s = states[idx]
-        x, y = float(s.x), float(s.y)
-        theta = float(s.theta)
-        # Arrow shows rocket "up" direction
-        dx = np.sin(theta) * 5
-        dy = np.cos(theta) * 5
-        ax.arrow(x, y, dx, dy, head_width=2, head_length=1, fc='white', ec='black', alpha=0.7)
-
-    ax.set_xlim(-params.planet_radius * 3, params.planet_radius * 3)
-    ax.set_ylim(-params.planet_radius * 3, params.planet_radius * 3)
-    ax.set_aspect('equal')
-    ax.set_xlabel('X Position')
-    ax.set_ylabel('Y Position')
-    ax.set_title(title)
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-
-    # Dark background for space
-    ax.set_facecolor('#0d1b2a')
-    fig.patch.set_facecolor('#0d1b2a')
-    ax.tick_params(colors='white')
-    ax.xaxis.label.set_color('white')
-    ax.yaxis.label.set_color('white')
-    ax.title.set_color('white')
-    ax.legend(facecolor='#1b263b', edgecolor='white', labelcolor='white')
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, facecolor=fig.get_facecolor())
-        plt.close()
-    else:
-        plt.show()
-
-    return fig
-
-
-# Test the environment
-if __name__ == "__main__":
-    # Create environment
-    env = RocketLander()
-    params = env.default_params
-
-    # Test reset and step
-    key = jax.random.PRNGKey(42)
-
-    # JIT compile for speed
-    reset_fn = jax.jit(env.reset_env)
-    step_fn = jax.jit(env.step_env)
-
-    # Reset environment
-    key, reset_key = jax.random.split(key)
-    obs, state = reset_fn(reset_key, params)
-
-    print("Initial observation shape:", obs.shape)
-    print("Initial observation:", obs)
-    print(f"Initial position: ({state.x:.2f}, {state.y:.2f})")
-    print(f"Initial velocity: ({state.dx:.2f}, {state.dy:.2f})")
-    print(f"Orbit radius: {jnp.sqrt(state.x ** 2 + state.y ** 2):.2f}")
-    print(f"Target angle: {state.target_angle:.2f} rad")
-
-    # Run a few steps with random actions
-    states = [state]
-    for i in range(100):
-        key, action_key, step_key = jax.random.split(key, 3)
-        # Random action: slight thrust, no gimbal
-        action = jax.random.uniform(action_key, shape=(2,), minval=-1.0, maxval=1.0)
-        action = action.at[0].set(-0.5)  # Low throttle
-
-        obs, state, reward, done, info = step_fn(step_key, state, action, params)
-        states.append(state)
-
-        if done:
-            print(f"Episode ended at step {i + 1}")
-            break
-
-    print(f"\nFinal position: ({state.x:.2f}, {state.y:.2f})")
-    print(f"Final velocity: ({state.dx:.2f}, {state.dy:.2f})")
-    print(f"Final altitude: {jnp.sqrt(state.x ** 2 + state.y ** 2) - params.planet_radius:.2f}")
-    print(f"Fuel remaining: {state.fuel:.2f}")
-
-    # Visualize
-    visualize_trajectory(states, params, "Random Policy Test")
