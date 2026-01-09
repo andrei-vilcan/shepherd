@@ -21,3 +21,5 @@ src/.DS_Store
 src/__pycache__/gymnax_rocket_env.cpython-311.pyc
 /src/__pycache__
 /src/visualizations
+/src/visualizations 1
+/src/visualizations 2
