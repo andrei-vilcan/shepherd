@@ -68,27 +68,26 @@ class EnvParams(environment.EnvParams):
     landing_position_tolerance: float = jnp.pi/30
 
     # terminal rewards
-    reward_landed: float = 100.0
-    reward_sl_cp_co_ls: float = 1000.0
-    reward_nsl_cp : float = 200.0
-    reward_nsl_ncp: float = 100.0
-    reward_sl_ncp_co_ls: float = 500.0
-    reward_out_of_fuel: float = -50.0
+    reward_landed: float = 1000.0
+    reward_sl_cp_co_ls: float = 100000.0
+    reward_nsl_cp: float = 15000.0
+    reward_nsl_ncp: float = 4000.0
+    reward_sl_ncp_co_ls: float = 25000.0
+    reward_out_of_fuel: float = -100.0
     reward_out_of_bounds: float = -1000.0
     reward_timeout: float = -2000.0
 
     # non-terminal rewards
-    reward_altitude_factor: float = 0.001
-    reward_angular_position_factor: float = 0.0003
-    reward_radial_velocity_factor: float = 0.0003
-    reward_tangential_velocity_factor: float = 0.0005
-    reward_angle_factor: float = 0.0003
-    reward_angular_velocity_factor: float = 0.00005
-    reward_fuel_penalty: float = 0.0  # Disabled to encourage engine use
-    reward_low_velocity_near_surface: float = 0.0005
-    reward_deceleration_with_fuel: float = 0.0003
-    reward_retrograde_orientation: float = 0.0005
-    reward_retrograde_burn: float = 0.02  # Reward for firing engine while aligned for braking
+    reward_coef_retrograde_burn: float = 10.0
+    reward_coef_v_tangential: float = -10.0
+    reward_coef_altitude: float = -0.3
+    reward_coed_theta_relative: float = -100.0
+    reward_coef_omega: float = -100.0
+    reward_coef_delta_beta: float = 10.0
+    reward_coef_velocity: float = -1.0
+
+    punish_coef_omega: float = 0.1
+    punish_coef_alpha: float = 0.02
 
 
 class RocketLander(environment.Environment[EnvState, EnvParams]):
@@ -199,16 +198,19 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         y_init = orbit_radius_init * jnp.sin(angle_init)
 
         orbit_velocity_magnitude_init = jnp.sqrt(G * params.planet_mass / orbit_radius_init)
+
         # Add noise scaled by the noise parameter
-        velocity_noise = params.init_orbit_velocity_noise * (2.0 * jax.random.uniform(orbit_vel_noise_key) - 1.0)
-        orbit_velocity_magnitude_init *= (1.0 + velocity_noise)
+        # velocity_noise = params.init_orbit_velocity_noise * (2.0 * jax.random.uniform(orbit_vel_noise_key) - 1.0)
+        # orbit_velocity_magnitude_init *= (1.0 + velocity_noise)
 
         dx_init = -orbit_velocity_magnitude_init * jnp.sin(angle_init)  # negative for counterclockwise orbit
         dy_init = orbit_velocity_magnitude_init * jnp.cos(angle_init)
 
         # initial angle and angular velocity
-        theta_init = angle_init + (3/2)*jnp.pi # rocket always orbiting "backwards" (thruster facing direction of motion)
-        omega_init = jnp.array(0.0)  # no initial angular velocity
+        theta_init = angle_init + (3/2) * jnp.pi  # rocket always orbiting "backwards" (thruster facing direction of motion)
+
+        # tidal locking
+        omega_init = orbit_velocity_magnitude_init / orbit_radius_init
 
         target_angle = jax.random.uniform(target_angle_key, minval=0.0, maxval=2.0 * jnp.pi)
 
@@ -241,21 +243,19 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
 
         positional_angle = jnp.arctan2(state.y, state.x)
 
-        delta_angle = state.target_angle - positional_angle
-        delta_angle = angle_normalize(delta_angle)
+        delta_beta = angle_normalize(state.target_angle - positional_angle)
 
         radial_vel = (state.x * state.dx + state.y * state.dy) / r
         tangential_vel = (state.x * state.dy - state.y * state.dx) / r
 
-        theta_relative = state.theta - positional_angle
-        theta_relative = angle_normalize(theta_relative)
+        theta_relative = angle_normalize(state.theta - positional_angle)
 
         # observation
         obs = jnp.array(
             [
                 # polar coordinates (position)
                 altitude,
-                delta_angle,
+                delta_beta,
                 # polar coordinates (velocity)
                 radial_vel,
                 tangential_vel,
@@ -306,7 +306,7 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
 
         # angular distance from target landing spot
         positional_angle = jnp.arctan2(new_state.y, new_state.x)
-        delta_angle = jnp.abs(angle_normalize(new_state.target_angle - positional_angle))
+        delta_beta = jnp.abs(angle_normalize(new_state.target_angle - positional_angle))
 
         # various velocities
         v_total = jnp.sqrt(new_state.dx ** 2 + new_state.dy ** 2)
@@ -322,7 +322,7 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         normalized_altitude_old = jnp.clip(altitude_old / (params.init_max_orbit_radius - params.planet_radius), 0.0, 2.0)
 
         positional_angle_old = jnp.arctan2(old_state.y, old_state.x)
-        delta_angle_old = jnp.abs(angle_normalize(old_state.target_angle - positional_angle_old))
+        delta_beta_old = jnp.abs(angle_normalize(old_state.target_angle - positional_angle_old))
 
         v_total_old = jnp.sqrt(old_state.dx ** 2 + old_state.dy ** 2)
         v_radial_old = (old_state.x * old_state.dx + old_state.y * old_state.dy) / r_old
@@ -332,7 +332,7 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
 
         ## landing conditions
         slow = v_total < params.landing_max_speed
-        correct_position = delta_angle <= params.landing_position_tolerance
+        correct_position = delta_beta <= params.landing_position_tolerance
         correct_orientation = jnp.abs(theta_relative) <= params.landing_max_angle
         low_spin = jnp.abs(new_state.omega) <= params.landing_max_omega
 
@@ -346,11 +346,11 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
 
         # ideal landing at incorrect position
         sl_ncp_co_ls = landed & slow & ~correct_position & correct_orientation & low_spin
-        terminal_reward = jnp.where(sl_ncp_co_ls, params.reward_sl_ncp_co_ls * jnp.exp(-delta_angle * 2.0), terminal_reward)
+        terminal_reward = jnp.where(sl_ncp_co_ls, params.reward_sl_ncp_co_ls * jnp.exp(-delta_beta * 2.0), terminal_reward)
 
         # slow landing but wrong orientation/spin
         sl_nco_nls = landed & slow & ~(correct_orientation & low_spin)
-        slow_reward = 100.0 * jnp.exp(-delta_angle)
+        slow_reward = 100.0 * jnp.exp(-delta_beta)
         terminal_reward = jnp.where(sl_nco_nls, slow_reward, terminal_reward)
 
         # non-ideal (fast) landing at correct position
@@ -378,56 +378,40 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         retrograde_alignment = (1.0 - alignment) / 2.0
         throttle_used = new_state.throttle > 0.1
         velocity_factor = jnp.minimum(v_total / 10.0, 1.0)
-        retrograde_burn_reward = params.reward_retrograde_burn * retrograde_alignment * throttle_used * velocity_factor
-        shaping_reward += retrograde_burn_reward
+        shaping_reward += params.reward_coef_retrograde_burn * retrograde_alignment * throttle_used * velocity_factor
 
-        # done
         # reward tangential velocity -> 0
-        shaping_reward += -0.3 * jnp.abs(v_tangential) - jnp.abs(v_tangential_old)
+        shaping_reward += params.reward_coef_v_tangential * jnp.abs(v_tangential) - jnp.abs(v_tangential_old)
 
-        # done
-        # if delta_angle -> 0, reward altitude -> 0
-        delta_angle_factor = jnp.exp(-delta_angle * 3)
+        # if delta_beta -> 0, reward altitude -> 0
+        delta_beta_factor = jnp.exp(-delta_beta * 3)
         delta_altitude = normalized_altitude - normalized_altitude_old
-        shaping_reward += -1.0 * delta_angle_factor * delta_altitude
+        shaping_reward += params.reward_coef_altitude * delta_beta_factor * delta_altitude
 
         # if landing (low altitude and low velocity), reward theta_relative -> 0
         near_landing_factor = jnp.exp(-3.0 * normalized_altitude) * jnp.exp(-v_total)
         delta_theta_relative = jnp.abs(theta_relative) - jnp.abs(theta_relative_old)
-        shaping_reward += -1.0 * near_landing_factor * delta_theta_relative
+        shaping_reward += params.reward_coed_theta_relative * near_landing_factor * delta_theta_relative
 
         # if landing (same), reward angular_velocity -> 0
         delta_omega = jnp.abs(new_state.omega) - jnp.abs(old_state.omega)
-        shaping_reward += -1.0 * near_landing_factor * delta_omega
+        shaping_reward += params.reward_coef_omega * near_landing_factor * delta_omega
 
-        # Reward for improving orientation (theta_relative -> 0), but only when near landing
-        theta_relative_change = jnp.abs(theta_relative) - jnp.abs(theta_relative_old)
-        shaping_reward += -1.0 * near_landing_factor * theta_relative_change
-
-        # reward being near target (altitude -> 0, delta_angle -> 0)
+        # if altitude -> 0, reward delta_beta -> 0
         low_altitude_factor = jnp.exp(-normalized_altitude * 2.0)
-        near_target_factor = jnp.exp(-delta_angle * 2.0)
-        landing_zone_bonus = 0.1 * low_altitude_factor * near_target_factor * near_target_factor
-        shaping_reward += landing_zone_bonus
+        near_target_factor = jnp.exp(-delta_beta * 2.0)
+        shaping_reward += params.reward_coef_delta_beta * low_altitude_factor * near_target_factor * near_target_factor
 
-        # reward velocity -> 0
-        # version that punishes increases in velocity
-        """delta_v = -(v_total - v_total_old)
-        velocity_decrease = jnp.maximum(0.0, delta_v)
-        velocity_decrease_reward = 0.1 * velocity_decrease
-        shaping_reward += velocity_decrease_reward"""
-        # version that only rewards decrease, does not punish increase
+        # reward velocity -> 0 (only rewards decrease, does not punish increase)
         delta_v = v_total - v_total_old
-        shaping_reward += -0.1 * jnp.maximum(0.0, -delta_v)
+        shaping_reward += params.reward_coef_velocity * jnp.maximum(0.0, -delta_v)
 
         # punish high angular velocity
         high_omega = jnp.abs(new_state.omega) > 2.0
-        angular_velocity_punishment = 0.1 * high_omega * (jnp.abs(new_state.omega) - 2.0)
-        shaping_reward -= angular_velocity_punishment
+        shaping_reward -= params.punish_coef_omega * high_omega * (jnp.abs(new_state.omega) - 2.0)
 
         # punish (angular) distance from target
-        distance_from_target_penalty = 0.02 * delta_angle
-        shaping_reward -= distance_from_target_penalty
+        shaping_reward -= params.punish_coef_alpha * delta_angle
 
         reward = jnp.where(is_terminal, terminal_reward, shaping_reward)
 
