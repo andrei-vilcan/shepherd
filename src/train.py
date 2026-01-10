@@ -6,6 +6,7 @@ import jax.random as jr
 from jax.random import PRNGKey
 import optax
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from rocket_env import RocketLander, EnvParams, EnvState
 from vis import visualize_trajectory
@@ -374,23 +375,24 @@ def train(
     print(f"  Saving visualizations to: {VIS_FOLDER}")
     print()
     
-    for i in range(num_iters):
+    pbar = tqdm(range(num_iters), desc="Training", unit="iter")
+    for i in pbar:
         # Training step
         (current_params, current_opt_state, current_Gs), mean_reward = step(
             (current_params, current_opt_state, current_Gs), iter_keys[i]
         )
         history.append(float(mean_reward))
         
-        # Logging
-        if (i + 1) % 100 == 0:
-            avg_reward = jnp.mean(jnp.array(history[-100:]))
-            print(f"Iteration {i + 1}/{num_iters} | Avg Reward (last 100): {avg_reward:.2f}")
+        # Update progress bar with current reward
+        if (i + 1) % 10 == 0:
+            avg_reward = jnp.mean(jnp.array(history[-100:])) if len(history) >= 100 else jnp.mean(jnp.array(history))
+            pbar.set_postfix({"Avg R": f"{avg_reward:.1f}"})
         
         # Visualization - save to file
         if (i + 1) % visualize_every == 0:
             vis_counter += 1
             save_path = os.path.join(VIS_FOLDER, f"{vis_counter:03d}_iter_{i + 1}.png")
-            print(f"\nSaving trajectory at iteration {i + 1} to {save_path}...")
+            tqdm.write(f"Saving trajectory at iteration {i + 1} to {save_path}...")
             key, vis_key = jr.split(key)
             visualize_policy(current_params, vis_key, title=f"Iteration {i + 1}", save_path=save_path)
         
@@ -399,7 +401,7 @@ def train(
             model_path = os.path.join(VIS_FOLDER, f"model_iter_{i + 1}.pkl")
             with open(model_path, "wb") as f:
                 pickle.dump(current_params, f)
-            print(f"Saved model checkpoint to {model_path}")
+            tqdm.write(f"Saved model checkpoint to {model_path}")
     
     # Final visualization
     vis_counter += 1
