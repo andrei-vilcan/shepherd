@@ -58,7 +58,7 @@ class EnvParams(environment.EnvParams):
 
     # initialization parameters
     init_min_orbit_radius: float = 80.0
-    init_max_orbit_radius: float = 150.0
+    init_max_orbit_radius: float = 100.0
     init_orbit_velocity_noise: float = 0.1
 
     # good landing thresholds
@@ -411,7 +411,7 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         shaping_reward -= params.punish_coef_omega * high_omega * (jnp.abs(new_state.omega) - 2.0)
 
         # punish (angular) distance from target
-        shaping_reward -= params.punish_coef_alpha * delta_angle
+        shaping_reward -= params.punish_coef_alpha * delta_beta
 
         reward = jnp.where(is_terminal, terminal_reward, shaping_reward)
 

@@ -477,7 +477,7 @@ def visualize_policy(params, key, title="Policy Trajectory", save_path=None):
 if __name__ == "__main__":
     # Training hyperparameters
     params, history = train(
-        num_iters=50000,
+        num_iters=10000,
         steps_in_episode=1500,
         lr=0.0002,
         gamma=0.995,
