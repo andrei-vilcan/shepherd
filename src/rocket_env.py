@@ -40,11 +40,15 @@ class EnvState(environment.EnvState):
 @struct.dataclass
 class EnvParams(environment.EnvParams):
     """Parameters for the rocket landing environment."""
+    max_steps_in_episode: int = 1500
+
     dt: float = 0.05
 
+    # planet properties
     planet_radius: float = 50.0
     planet_mass: float = 5.0e14
 
+    # rocket properties
     rocket_max_thrust: float = 38000.0
     rocket_max_gimbal: float = 0.3
     rocket_mass: float = 2600.0
@@ -52,16 +56,12 @@ class EnvParams(environment.EnvParams):
     rocket_initial_fuel: float = 5000.0
     rocket_fuel_consumption_rate: float = 100.
 
+    # initialization parameters
     init_min_orbit_radius: float = 80.0
     init_max_orbit_radius: float = 150.0
     init_orbit_velocity_noise: float = 0.1
 
-    noise_pos: float = 0.1
-    noise_vel: float = 0.5
-    noise_angle: float = 0.1
-
-    max_steps_in_episode: int = 1500
-
+    # good landing thresholds
     landing_max_speed: float = 2.0
     landing_max_angle: float = 0.3
     landing_max_omega: float = 0.5
@@ -75,8 +75,9 @@ class EnvParams(environment.EnvParams):
     reward_sl_ncp_co_ls: float = 500.0
     reward_out_of_fuel: float = -50.0
     reward_out_of_bounds: float = -1000.0
-    reward_timeout: float = -2000.0  # Much higher penalty to discourage staying in orbit
-    # shaping rewards
+    reward_timeout: float = -2000.0
+
+    # non-terminal rewards
     reward_altitude_factor: float = 0.001
     reward_angular_position_factor: float = 0.0003
     reward_radial_velocity_factor: float = 0.0003
@@ -268,22 +269,6 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
             ]
         )
 
-        # Add observation noise to simulate sensor uncertainty
-        # if key is not None:
-        #     noise = jax.random.normal(key, shape=(9,))
-        #     noise_scales = jnp.array([
-        #         params.noise_pos,      # altitude
-        #         params.noise_angle,    # delta_angle
-        #         params.noise_vel,      # radial_vel
-        #         params.noise_vel,      # tangential_vel
-        #         params.noise_angle,    # theta_relative
-        #         params.noise_angle,    # omega
-        #         0.0,                   # throttle (known exactly)
-        #         0.0,                   # gimbal (known exactly)
-        #         0.0,                   # fuel (known exactly)
-        #     ])
-        #     obs = obs + noise * noise_scales
-
         return obs
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> jax.Array:
@@ -385,7 +370,6 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         ### non-terminal rewards
         
         shaping_reward = jnp.array(0.0)
-        gamma = 0.99
 
         # reward retrograde burn
         thrust_angle = new_state.theta + new_state.gimbal
@@ -397,42 +381,53 @@ class RocketLander(environment.Environment[EnvState, EnvParams]):
         retrograde_burn_reward = params.reward_retrograde_burn * retrograde_alignment * throttle_used * velocity_factor
         shaping_reward += retrograde_burn_reward
 
+        # done
         # reward tangential velocity -> 0
-        tangential_shaping = -0.3 * (gamma * jnp.abs(v_tangential) - jnp.abs(v_tangential_old))
-        shaping_reward += tangential_shaping
+        shaping_reward += -0.3 * jnp.abs(v_tangential) - jnp.abs(v_tangential_old)
 
+        # done
         # if delta_angle -> 0, reward altitude -> 0
         delta_angle_factor = jnp.exp(-delta_angle * 3)
-        altutude_reward = -delta_angle_factor * (gamma * normalized_altitude - normalized_altitude_old)
-
-        shaping_reward += altutude_reward
+        delta_altitude = normalized_altitude - normalized_altitude_old
+        shaping_reward += -1.0 * delta_angle_factor * delta_altitude
 
         # if landing (low altitude and low velocity), reward theta_relative -> 0
-        near_landing_factor = jnp.exp(-normalized_altitude * 3.0) * jnp.exp(-v_total)
-        theta_relative_reward = -1.0 * near_landing_factor * (gamma * jnp.abs(theta_relative) - jnp.abs(theta_relative_old))
-        shaping_reward += theta_relative_reward
+        near_landing_factor = jnp.exp(-3.0 * normalized_altitude) * jnp.exp(-v_total)
+        delta_theta_relative = jnp.abs(theta_relative) - jnp.abs(theta_relative_old)
+        shaping_reward += -1.0 * near_landing_factor * delta_theta_relative
 
-        # if landing (same), reward angular velocity -> 0
-        angular_velocity_reward = -0.1 * near_landing_factor * (gamma * jnp.abs(new_state.omega) - jnp.abs(old_state.omega))
-        shaping_reward += angular_velocity_reward
+        # if landing (same), reward angular_velocity -> 0
+        delta_omega = jnp.abs(new_state.omega) - jnp.abs(old_state.omega)
+        shaping_reward += -1.0 * near_landing_factor * delta_omega
 
-        # if altitude -> 0 and delta_angle -> 0, reward v_total -> 0
+        # Reward for improving orientation (theta_relative -> 0), but only when near landing
+        theta_relative_change = jnp.abs(theta_relative) - jnp.abs(theta_relative_old)
+        shaping_reward += -1.0 * near_landing_factor * theta_relative_change
+
+        # reward being near target (altitude -> 0, delta_angle -> 0)
         low_altitude_factor = jnp.exp(-normalized_altitude * 2.0)
-        low_velocity_factor = jnp.exp(-delta_angle * 2.0)
-        low_delta_angle_factor = jnp.exp(-delta_angle * 2.0)
-        low_velocity_reward = 0.1 * low_altitude_factor * low_velocity_factor * low_delta_angle_factor
-        shaping_reward += low_velocity_reward
+        near_target_factor = jnp.exp(-delta_angle * 2.0)
+        landing_zone_bonus = 0.1 * low_altitude_factor * near_target_factor * near_target_factor
+        shaping_reward += landing_zone_bonus
 
         # reward velocity -> 0
-        delta_v = -(v_total - v_total_old)
+        # version that punishes increases in velocity
+        """delta_v = -(v_total - v_total_old)
         velocity_decrease = jnp.maximum(0.0, delta_v)
         velocity_decrease_reward = 0.1 * velocity_decrease
-        shaping_reward += velocity_decrease_reward
+        shaping_reward += velocity_decrease_reward"""
+        # version that only rewards decrease, does not punish increase
+        delta_v = v_total - v_total_old
+        shaping_reward += -0.1 * jnp.maximum(0.0, -delta_v)
 
         # punish high angular velocity
         high_omega = jnp.abs(new_state.omega) > 2.0
         angular_velocity_punishment = 0.1 * high_omega * (jnp.abs(new_state.omega) - 2.0)
         shaping_reward -= angular_velocity_punishment
+
+        # punish (angular) distance from target
+        distance_from_target_penalty = 0.02 * delta_angle
+        shaping_reward -= distance_from_target_penalty
 
         reward = jnp.where(is_terminal, terminal_reward, shaping_reward)
 

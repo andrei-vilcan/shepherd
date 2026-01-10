@@ -1,15 +1,5 @@
-"""Training script for rocket landing using REINFORCE with Gaussian policy."""
 import os
 import pickle
-
-# ============================================================================
-# JAX Performance Configuration (set before importing JAX)
-# ============================================================================
-# Enable XLA optimizations for CPU
-os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=true")
-# Use all available CPU cores
-os.environ.setdefault("XLA_FLAGS", os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=1")
-
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -17,16 +7,8 @@ from jax.random import PRNGKey
 import optax
 import matplotlib.pyplot as plt
 
-# Enable 64-bit precision if needed (disabled for speed)
-# jax.config.update("jax_enable_x64", True)
-
-# Print device info at startup
-print(f"JAX version: {jax.__version__}")
-print(f"JAX backend: {jax.default_backend()}")
-print(f"JAX devices: {jax.devices()}")
-
 from rocket_env import RocketLander, EnvParams, EnvState
-from test_env import visualize_trajectory
+from vis import visualize_trajectory
 
 # Create the environment
 env = RocketLander()
@@ -36,29 +18,19 @@ env_params = env.default_params
 VIS_FOLDER = os.path.join(os.path.dirname(__file__), "visualizations")
 
 
-def ensure_vis_folder():
-    """Create visualizations folder if it doesn't exist."""
-    if not os.path.exists(VIS_FOLDER):
-        os.makedirs(VIS_FOLDER)
-        print(f"Created visualization folder: {VIS_FOLDER}")
-
-
-# =============================================================================
-# Neural Network Policy (Gaussian)
-# =============================================================================
+# setting up a basic neural network
 
 def initialize_mlp(layer_sizes, key: PRNGKey, scale: float = 1e-2):
     """
-    Initialize MLP parameters.
-    
     Inputs:
-        layer_sizes (tuple): Tuple of layer sizes including input and output.
-        key (PRNGKey): Random key for initialization.
-        scale (float): Standard deviation of initial weights and biases.
+        layer_sizes (tuple) Tuple of shapes of the neural network layers. Includes the input shape, hidden layer shape, and output layer shape.
+        key (PRNGKey)
+        scale (float) standard deviation of initial weights and biases
 
-    Return: 
-        params (list): List of (weights, biases) tuples for each layer.
+    Return:
+        params (List) Tuple of weights and biases - [ (weights_1, biases_1), ..., (weights_n, biases_n) ]
     """
+
     keys = jr.split(key, 2 * len(layer_sizes))
     params = []
 
@@ -390,7 +362,6 @@ def train(
     current_Gs = Gs
     
     # Ensure visualization folder exists
-    ensure_vis_folder()
     vis_counter = 0
     
     print(f"Starting training for {num_iters} iterations...")
@@ -490,9 +461,11 @@ def visualize_policy(params, key, title="Policy Trajectory", save_path=None):
         if done[i]:
             break
     
-    total_reward = float(jnp.sum(reward))
+    # Only sum rewards up to the terminal step (after that, rewards are garbage due to r=0)
+    episode_length = len(states)
+    total_reward = float(jnp.sum(reward[:episode_length]))
     print(f"  Total reward: {total_reward:.2f}")
-    print(f"  Episode length: {len(states)} steps")
+    print(f"  Episode length: {episode_length} steps")
     
     visualize_trajectory(states, env_params, title=f"{title} (R={total_reward:.1f})", save_path=save_path)
 
